@@ -10,12 +10,12 @@ function getConfigFilePath(app) {
 
 // 官方账户会话独立于设置表单保存。
 function getOfficialApiSessionFilePath(app) {
-  return path.join(getUserDataPath(app), 'official_api_session.json');
+  return path.join(getUserDataPath(app), 'official_api_session_v4.json');
 }
 
 // 支付二维码独立缓存，订单状态仍由服务端管理。
 function getOfficialRechargeQrCachePath(app) {
-  return path.join(getUserDataPath(app), 'official_recharge_qr_cache.json');
+  return path.join(getUserDataPath(app), 'official_recharge_qr_cache_v4.json');
 }
 
 function getLicenseFilePath(app) {

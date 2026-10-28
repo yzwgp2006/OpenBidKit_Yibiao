@@ -86,7 +86,7 @@ const DEFAULT_TEXT_CONCURRENCY_LIMIT = 10;
 const DEFAULT_TEXT_TEMPERATURE = 0.7;
 
 const textProviderDefaults: Record<TextModelProvider, TextModelConfig> = {
-  official: { api_key: '', base_url: 'https://v3.yibiao.pro/qhp-yibiao/anonymous/yibiao/openai/v1', model_name: 'yibiao-text', multimodal_enabled: true, reasoning_effort: '', context_length_limit: 258000, output_token_limit: 128000, concurrency_limit: 50, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
+  official: { api_key: '', base_url: 'https://v4-i.yibiao.pro:11443/qhp-ai/anonymous/openai/v1', model_name: 'TEXT_GENERATION', multimodal_enabled: true, reasoning_effort: '', context_length_limit: 258000, output_token_limit: 128000, concurrency_limit: 50, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
   jinlong: { api_key: '', base_url: 'https://jlaudeapi.com/v1', model_name: 'gpt-3.5-turbo', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: DEFAULT_TEXT_OUTPUT_TOKEN_LIMIT, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
   volcengine: { api_key: '', base_url: 'https://ark.cn-beijing.volces.com/api/v3', model_name: '', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: DEFAULT_TEXT_OUTPUT_TOKEN_LIMIT, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
   deepseek: { api_key: '', base_url: 'https://api.deepseek.com', model_name: '', multimodal_enabled: false, reasoning_effort: '', context_length_limit: DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT, output_token_limit: DEFAULT_TEXT_OUTPUT_TOKEN_LIMIT, concurrency_limit: DEFAULT_TEXT_CONCURRENCY_LIMIT, temperature_enabled: false, temperature: DEFAULT_TEXT_TEMPERATURE, request_mode: 'stream' },
@@ -216,6 +216,7 @@ function textProfileFromState(textModel: SettingsPageState['textModel']): TextMo
 }
 
 const imageProviders: Array<{ value: ImageModelProvider; label: string }> = [
+  { value: 'official', label: '易标官方 API' },
   { value: 'jinlong', label: '金龙中转站【推荐】' },
   { value: 'volcengine', label: '火山方舟' },
   { value: 'google-ai-studio', label: 'Google AI Studio' },
@@ -289,6 +290,18 @@ function normalizeImageSize(provider: ImageModelProvider, value?: string): Image
 }
 
 const imageProviderDefaults: ImageModelProfiles = {
+  official: {
+    provider: 'official',
+    base_url: 'https://v4-i.yibiao.pro:11443/qhp-ai/anonymous/openai/v1',
+    api_key: '',
+    model_name: 'IMAGE_GENERATION',
+    image_size: '1024x1024',
+    request_mode: 'stream',
+    concurrency_limit: DEFAULT_IMAGE_CONCURRENCY_LIMIT,
+    status: 'untested',
+    tested_at: '',
+    last_error: '',
+  },
   jinlong: {
     provider: 'jinlong',
     base_url: 'https://img-api.jlaudeapi.com/v1',
@@ -366,6 +379,7 @@ const imageProviderDefaults: ImageModelProfiles = {
 };
 
 const imageProviderApiKeyUrls: Record<ImageModelProvider, string> = {
+  official: '',
   jinlong: 'https://s.markup.com.cn/jl',
   volcengine: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey',
   'google-ai-studio': 'https://aistudio.google.com/api-keys',
@@ -375,6 +389,7 @@ const imageProviderApiKeyUrls: Record<ImageModelProvider, string> = {
 };
 
 const imageProviderLabels: Record<ImageModelProvider, string> = {
+  official: '易标官方 API',
   jinlong: '金龙中转站',
   volcengine: '火山方舟',
   'google-ai-studio': 'Google AI Studio',
@@ -384,6 +399,7 @@ const imageProviderLabels: Record<ImageModelProvider, string> = {
 };
 
 function getImageBaseUrlDescription(provider: ImageModelProvider) {
+  if (provider === 'official') return '易标 V4 官方图片生成接口，与文本模型共用账户和点数';
   if (provider === 'jinlong') return '金龙中转站 OpenAI 兼容接口地址';
   if (provider === 'volcengine') return '火山方舟 OpenAI 兼容接口地址';
   if (provider === 'agnes') return 'Agnes AI OpenAI 兼容接口地址';
@@ -402,6 +418,7 @@ function getImageApiKeyDescription(provider: ImageModelProvider) {
 }
 
 function getImageModelDescription(provider: ImageModelProvider) {
+  if (provider === 'official') return '自动使用官方图片生成模型';
   if (provider === 'jinlong') return '填写金龙中转站已开通的生图模型名称';
   if (provider === 'volcengine') return '填写火山方舟控制台中已开通的模型或推理接入点 ID';
   if (provider === 'agnes') return '填写 Agnes AI 已开通的生图模型名称';
@@ -754,6 +771,8 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
         setState((prev) => ({
           ...prev,
           textModel: prev.textModel.provider === 'official' ? { ...prev.textModel, api_key: apiKey } : prev.textModel,
+          imageModel: prev.imageModel.provider === 'official' ? { ...prev.imageModel, api_key: apiKey } : prev.imageModel,
+          imageModelProfiles: { ...prev.imageModelProfiles, official: { ...prev.imageModelProfiles.official, api_key: apiKey } },
           textModelProfiles: {
             ...prev.textModelProfiles,
             official: { ...prev.textModelProfiles.official, api_key: apiKey },
@@ -762,6 +781,8 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
         setSavedConfig((prev) => prev ? {
           ...prev,
           ...(prev.text_model_provider === 'official' ? { api_key: apiKey } : {}),
+          image_model: prev.image_model.provider === 'official' ? { ...prev.image_model, api_key: apiKey } : prev.image_model,
+          image_model_profiles: { ...prev.image_model_profiles, official: { ...prev.image_model_profiles.official, api_key: apiKey } },
           text_model_profiles: {
             ...prev.text_model_profiles,
             official: { ...prev.text_model_profiles.official, api_key: apiKey },
@@ -1060,7 +1081,7 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
     setState((prev) => ({
       ...prev,
       officialApiModelType: modelType,
-      textModel: { ...prev.textModel, model_name: modelType === 'high-quality' ? 'yibiao-reasoning' : 'yibiao-text' },
+      textModel: { ...prev.textModel, model_name: modelType === 'high-quality' ? 'REASONING' : 'TEXT_GENERATION' },
     }));
   };
 
@@ -2195,7 +2216,13 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
                 disabled={state.imageModel.provider !== 'custom' && state.imageModel.provider !== 'comfyui'}
               />
             </label>
-            {state.imageModel.provider !== 'comfyui' && (
+            {state.imageModel.provider === 'official' && (
+              <div className="settings-row">
+                <div className="settings-row-copy"><strong>官方账户</strong><span>自动使用文本模型页的官方账户与可用 Key，生成图片会消耗点数</span></div>
+                <button type="button" className="inline-action" onClick={() => { void changeSettingsTab('text-model'); }}>账户与余额</button>
+              </div>
+            )}
+            {state.imageModel.provider !== 'comfyui' && state.imageModel.provider !== 'official' && (
             <label className="settings-row">
               <div className="settings-row-copy">
                 <strong>API Key</strong>
@@ -2245,9 +2272,10 @@ function SettingsPage({ onDeveloperModeChange, request, onRequestHandled, regist
                     value={state.imageModel.model_name}
                     placeholder={getImageModelPlaceholder(state.imageModel.provider)}
                     onChange={(event) => updateImageModelConfig({ model_name: event.target.value })}
+                    disabled={state.imageModel.provider === 'official'}
                   />
                 ))}
-                {state.imageModel.provider !== 'comfyui' && (
+                {state.imageModel.provider !== 'comfyui' && state.imageModel.provider !== 'official' && (
                 <button
                   type="button"
                   className="inline-action"

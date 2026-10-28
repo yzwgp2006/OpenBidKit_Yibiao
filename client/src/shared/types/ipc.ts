@@ -1,5 +1,5 @@
 import type { AiHttpErrorPayload, ChatCompletionRequest, JsonCompletionRequest } from './ai';
-import type { OfficialTransactionsPage, OfficialInvoiceApplicationInput, OfficialInvoiceInfo, OfficialAccountState, OfficialEmailCredentials, OfficialEmailPurpose, OfficialRechargeOption, OfficialRechargeOrder } from './officialAccount';
+import type { OfficialPage, OfficialPageQuery, OfficialRefund, OfficialInvoice, OfficialTransactionsPage, OfficialInvoiceApplicationInput, OfficialInvoiceInfo, OfficialAccountState, OfficialEmailCredentials, OfficialEmailPurpose, OfficialRechargeOption, OfficialRechargeOrder } from './officialAccount';
 import type { DuplicateCheckWorkspacePatch, DuplicateCheckWorkspaceState, FileSelectionResult } from './bid';
 import type { ClientConfig, ConfigSaveResult, ImageModelTestResult, ModelInfoResult, ModelListResult, UpdateChannel } from './config';
 import type { KnowledgeAnalysisSnapshot, KnowledgeBaseEvent, KnowledgeBaseIndex, KnowledgeBaseIndexMutationResult, KnowledgeBaseMutationResult, KnowledgeBaseSearchRequest, KnowledgeBaseSearchPage, KnowledgeBaseRetryDocumentResult, KnowledgeBaseStartMatchingResult, KnowledgeBaseUploadResult, KnowledgeDocument, KnowledgeFolder, KnowledgeItem } from '../../features/knowledge-base/types';
@@ -657,18 +657,22 @@ export interface YibiaoBridge {
     activateOfflineCode: (code: string) => Promise<LicenseOfflineActivationResult>;
   };
   officialAccount: {
-    redeemCode: (input: { code: string; requestNo: string }) => Promise<{ redeemedPoint: string }>;
-    createInvoiceApplication: (input: OfficialInvoiceApplicationInput) => Promise<void>;
+    redeemCode: (input: { code: string }) => Promise<{ pointValue: string }>;
+    createInvoiceApplication: (input: OfficialInvoiceApplicationInput) => Promise<OfficialInvoice>;
+    getInvoiceApplication: (orderNo: string) => Promise<OfficialInvoice | null>;
+    getRefunds: (orderNo: string) => Promise<OfficialRefund[]>;
+    createRefund: (orderNo: string) => Promise<OfficialRefund>;
     getInvoiceInfo: () => Promise<OfficialInvoiceInfo>;
     saveInvoiceInfo: (input: OfficialInvoiceInfo) => Promise<void>;
     getState: () => Promise<OfficialAccountState>;
     refreshBalance: () => Promise<OfficialAccountState>;
     getRechargeOptions: () => Promise<OfficialRechargeOption[]>;
-    createRechargeOrder: (input: { optionId: string }) => Promise<OfficialRechargeOrder>;
-    getRechargeOrders: () => Promise<OfficialRechargeOrder[]>;
-    getTransactions: (page: number) => Promise<OfficialTransactionsPage>;
-    getRechargeOrder: (id: string) => Promise<OfficialRechargeOrder>;
-    closeRechargeOrder: (id: string) => Promise<OfficialRechargeOrder>;
+    createRechargeOrder: (input: { productId: string } | { amountYuan: string }) => Promise<OfficialRechargeOrder>;
+    getRechargeOrders: (query: OfficialPageQuery) => Promise<OfficialPage<OfficialRechargeOrder>>;
+    getTransactions: (query: OfficialPageQuery) => Promise<OfficialTransactionsPage>;
+    getRechargeOrder: (orderNo: string) => Promise<OfficialRechargeOrder>;
+    refreshRechargeOrder: (orderNo: string) => Promise<OfficialRechargeOrder>;
+    closeRechargeOrder: (orderNo: string) => Promise<OfficialRechargeOrder>;
     onRechargeOrderChanged: (callback: (order: OfficialRechargeOrder) => void) => () => void;
     onStateChanged: (callback: (state: OfficialAccountState) => void) => () => void;
     sendEmailCode: (input: { email: string; purpose: OfficialEmailPurpose }) => Promise<boolean>;

@@ -93,16 +93,20 @@ const bridge = {
   officialAccount: {
     redeemCode: (input) => invokeOfficialAccount('redeem-code', input),
     createInvoiceApplication: (input) => invokeOfficialAccount('create-invoice-application', input),
+    getInvoiceApplication: (orderNo) => invokeOfficialAccount('get-invoice-application', orderNo),
+    getRefunds: (orderNo) => invokeOfficialAccount('get-refunds', orderNo),
+    createRefund: (orderNo) => invokeOfficialAccount('create-refund', orderNo),
     getInvoiceInfo: () => ipcRenderer.invoke('official-account:get-invoice-info'),
     saveInvoiceInfo: (input) => ipcRenderer.invoke('official-account:save-invoice-info', input),
     getState: () => invokeOfficialAccount('get-state'),
     refreshBalance: () => invokeOfficialAccount('refresh-balance'),
     getRechargeOptions: () => invokeOfficialAccount('get-recharge-options'),
     createRechargeOrder: (input) => invokeOfficialAccount('create-recharge-order', input),
-    getRechargeOrders: () => invokeOfficialAccount('get-recharge-orders'),
-    getTransactions: (page) => invokeOfficialAccount('get-transactions', page),
-    getRechargeOrder: (id) => invokeOfficialAccount('get-recharge-order', id),
-    closeRechargeOrder: (id) => invokeOfficialAccount('close-recharge-order', id),
+    getRechargeOrders: (query) => invokeOfficialAccount('get-recharge-orders', query),
+    getTransactions: (query) => invokeOfficialAccount('get-transactions', query),
+    getRechargeOrder: (orderNo) => invokeOfficialAccount('get-recharge-order', orderNo),
+    refreshRechargeOrder: (orderNo) => invokeOfficialAccount('refresh-recharge-order', orderNo),
+    closeRechargeOrder: (orderNo) => invokeOfficialAccount('close-recharge-order', orderNo),
     onRechargeOrderChanged: (callback) => {
       const listener = (_event, order) => callback(order);
       ipcRenderer.on('official-account:order', listener);

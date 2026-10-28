@@ -97,7 +97,7 @@ function copyAiHttpError(source, target) {
 function isOfficialBalanceInsufficient(payload) {
   try {
     const error = JSON.parse(String(payload?.body || '')).error;
-    return error?.type === 'yibiao_ai_error' && error.code === 'INSUFFICIENT_BALANCE';
+    return String(payload?.source || '').startsWith('official-') && error?.code === 'insufficient_balance';
   } catch {
     return false;
   }

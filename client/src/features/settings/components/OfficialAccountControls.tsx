@@ -161,8 +161,17 @@ export default function OfficialAccountControls({ onViewOrders, rechargeRequeste
               {account.identityType === 'anonymous' ? '绑定邮箱' : '登陆'}
             </button>
           )}
+          {account.identityType === 'anonymous' && (
+            <button type="button" className="inline-action" onClick={() => { setCode(''); setPurpose('LOGIN'); }}>邮箱登录</button>
+          )}
         </div>
       </div>
+      {account.identityType === 'email' && (
+        <div className="settings-row">
+          <div className="settings-row-copy"><strong>当前团队</strong><span>官方 AI 使用当前团队点数</span></div>
+          <span className="official-api-account">{account.teamName || account.subjectId || '—'}</span>
+        </div>
+      )}
       {account.error && <p className="official-api-empty" role="status">{account.error}</p>}
       <div className="settings-row">
         <div className="settings-row-copy"><strong>余额</strong></div>
@@ -193,7 +202,7 @@ export default function OfficialAccountControls({ onViewOrders, rechargeRequeste
         open={purpose !== null}
         onOpenChange={(open) => { if (!open) closeDialog(); }}
         title={title}
-        description={binding ? '使用邮箱验证码绑定当前账户。' : '使用邮箱验证码登陆官方账户。'}
+        description={binding ? '绑定后，当前匿名账户的点数将迁入邮箱的默认团队。' : '登录邮箱的默认团队。登录不会绑定当前匿名账户或迁移其点数。'}
         cardClassName="official-account-dialog"
         preventClose={busy !== null}
         actions={(

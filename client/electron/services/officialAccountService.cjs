@@ -2,9 +2,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { getOfficialApiSessionFilePath, getOfficialRechargeQrCachePath } = require('../utils/paths.cjs');
 const { fetchWithRedirect } = require('../utils/fetchWithRedirect.cjs');
+const { SERVICE_BASE_URL } = require('./officialApi.cjs');
 
-const SERVICE_BASE_URL = 'https://v3.yibiao.pro/qhp-yibiao';
 const API_BASE_URL = `${SERVICE_BASE_URL}/anonymous/yibiao/open`;
+const RECHARGE_BASE_URL = `${SERVICE_BASE_URL}/anonymous/yibiao/recharge`;
+const TEAM_RECHARGE_BASE_URL = `${SERVICE_BASE_URL}/yibiao/recharge`;
+const PAGE_SIZE = 5;
 const EMAIL_REFRESH_INTERVAL = 60 * 60 * 1000;
 const QR_CACHE_MAX_AGE = 24 * 60 * 60 * 1000;
 const QR_CACHE_CLEANUP_INTERVAL = 30 * 60 * 1000;
@@ -19,6 +22,23 @@ function writeJsonAtomic(filePath, value) {
   } finally {
     fs.rmSync(tempFile, { force: true });
   }
+}
+
+function amountYuan(fen) {
+  const value = BigInt(fen);
+  return `${value / 100n}.${String(value % 100n).padStart(2, '0')}`;
+}
+
+function orderView(order) {
+  return { ...order, id: String(order.id), sourceSubjectId: String(order.sourceSubjectId),
+    settledSubjectId: order.settledSubjectId == null ? null : String(order.settledSubjectId),
+    rechargePoint: String(order.rechargePoint), amountYuan: amountYuan(order.payAmountFen), qrCode: null };
+}
+
+function pageQuery({ page, sourceAccountId }) {
+  const query = new URLSearchParams({ offset: String((page - 1) * PAGE_SIZE), limit: String(PAGE_SIZE + 1) });
+  if (sourceAccountId) query.set('sourceAccountId', sourceAccountId);
+  return query;
 }
 
 // 管理官方账户会话；所有身份变更在 Main 中串行执行，令牌不发送给页面。
@@ -50,6 +70,8 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
   let refreshingBalance = null;
   let qrCodes = [];
   let qrCleanupTimer = null;
+  let balanceRevision = 0;
+  const settlementTimers = new Map();
 
   // 仅返回页面需要的账户展示状态。
   function getState() {
@@ -59,9 +81,16 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
       clientId,
       identityType: account ? session.kind : null,
       error: apiKeyError || sessionError,
-      email: account?.email || null,
+      email: account ? session.email || null : null,
       accountId: account?.accountId || null,
       availablePoint: account?.availablePoint ?? null,
+      subjectId: account?.subjectId ?? null,
+      teamName: account?.teamName ?? null,
+      isTeamAdmin: account?.isTeamAdmin === true,
+      netRechargePoint: account?.netRechargePoint ?? null,
+      totalConsumePoint: account?.totalConsumePoint ?? null,
+      balanceRevision,
+      sources: account?.sources?.map(({ sourceAccountId }) => ({ sourceAccountId: String(sourceAccountId) })) || [],
     };
   }
 
@@ -116,12 +145,16 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
 
   // 失效会话停止刷新，并静默回到未登录状态。
   function clearSession(message = '') {
+    settlementTimers.forEach(clearTimeout);
+    settlementTimers.clear();
     resetOrderTracking();
     clearTimeout(refreshTimer);
     refreshTimer = null;
     refreshAt = 0;
     session = null;
+    configStore.save({ official_api_version: 4, text_model_profiles: { official: { api_key: '' } } });
     sessionError = message;
+    apiKeyError = '';
     loading = false;
     publish();
     fs.rmSync(sessionFile, { force: true });
@@ -159,7 +192,11 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
     if (authenticated && response.status === 401) clearSession('登录已失效，请重新登录官方账户');
     let result;
     try {
-      result = await response.json();
+      // V4 的 Long 编号与点数即使以 JSON 数字返回，也不能经过 JS 浮点数舍入。
+      result = JSON.parse(await response.text(), (_key, value, context) => (
+        typeof value === 'number' && Number.isInteger(value) && !Number.isSafeInteger(value)
+          ? context.source : value
+      ));
     } catch (error) {
       throw Object.assign(new Error('官方账户响应读取失败，请稍后重试', { cause: error }), {
         retryable: response.status >= 500 || error instanceof TypeError,
@@ -167,24 +204,30 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
     }
     if (closed) throw new Error('官方账户服务已关闭');
     if (!response.ok || !result || (result.code !== 0 && result.code !== 200)) {
-      throw Object.assign(new Error(result?.msg || `官方账户请求失败（${response.status}）`), { retryable: response.status >= 500 });
+      throw Object.assign(new Error(result?.msg || result?.errorMsg || `官方账户请求失败（${response.status}）`), { retryable: response.status >= 500 });
     }
     return result.data;
   }
 
-  // 列表按创建时间倒序返回；复用最新有效同名 Key，没有则创建并立即保存。
+  // 邮箱身份读取成员可用列表；优先复用同名 Key，仅匿名账户或团队管理员可在空列表时创建。
   async function syncApiKey() {
     try {
-      const keys = await request('/api-keys', { method: 'GET', authenticated: true });
+      const isEmail = session.kind === 'email';
+      const keyOptions = isEmail ? { baseUrl: `${SERVICE_BASE_URL}/yibiao` } : {};
+      const keys = await request(isEmail ? '/api-keys/available' : '/api-keys', { ...keyOptions, method: 'GET', authenticated: true });
       if (!Array.isArray(keys)) throw new Error('API Key 列表格式不正确');
-      const key = keys.find((item) => item.name === '易标开源版' && item.status === 'ACTIVE'
-        && (!item.expireTime || Date.parse(item.expireTime) > Date.now()))
-        || await request('/api-keys', { body: { name: '易标开源版' }, authenticated: true });
-      if (typeof key?.apiKey !== 'string' || !key.apiKey.trim()) throw new Error('接口未返回完整 API Key');
-      configStore.save({ text_model_profiles: { official: { api_key: key.apiKey } } });
+      const available = isEmail ? keys : keys.filter((item) => item.status === 'ACTIVE'
+        && (!item.expireTime || Date.parse(item.expireTime) > Date.now()));
+      let key = available.find((item) => item.name === '易标开源版') || available[0];
+      if (!key) {
+        if (session.kind === 'email' && !session.account?.isTeamAdmin) throw new Error('当前团队没有可用 API Key，请联系团队管理员创建');
+        key = await request('/api-keys', { ...keyOptions, body: { name: '易标开源版' }, authenticated: true });
+      }
+      if (typeof key?.keyValue !== 'string' || !key.keyValue.trim()) throw new Error('接口未返回完整 API Key');
+      configStore.save({ official_api_version: 4, text_model_profiles: { official: { api_key: key.keyValue } } });
       apiKeyError = '';
     } catch (error) {
-      apiKeyError = '获取官方 API Key 失败，请重启软件或重新登录';
+      apiKeyError = `获取官方 API Key 失败：${error.message}`;
       throw new Error(apiKeyError, { cause: error });
     } finally {
       loading = false;
@@ -205,22 +248,25 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
 
   // 接收服务端签发的新令牌，立即保存并按有效期的 80% 安排刷新。
   function acceptAnonymousToken(token, account = session?.account || null) {
-    const lifetime = Number(token?.expiresInSeconds) * 1000;
-    if (!token?.token || !token.tokenHeader || !Number.isFinite(lifetime) || lifetime <= 0) {
+    // yb1 载荷最后一项为签发秒数，服务端有效期固定 15 分钟；这里只用于安排刷新。
+    const fields = typeof token === 'string' ? Buffer.from(token.split('.')[1] || '', 'base64url').toString('utf-8').split(':') : [];
+    const expiresAt = (Number(fields[5]) + 900) * 1000;
+    const lifetime = expiresAt - Date.now();
+    if (!token?.startsWith('yb1.') || fields.length !== 6 || !Number.isFinite(lifetime) || lifetime <= 0) {
       throw new Error('官方账户接口未返回有效令牌');
     }
     persist({
-      token: token.token,
+      token,
       kind: 'anonymous',
-      expiresAt: Date.now() + lifetime,
-      account: account ? { accountId: account.accountId, email: account.email || null, availablePoint: account.availablePoint } : null,
+      expiresAt,
+      account,
     });
     sessionError = '';
     scheduleRefresh(lifetime * 0.8);
   }
 
   // 邮箱响应使用 QHP JWT；读取 exp 安排本机到期检查，签名与权限由服务端验证。
-  function acceptEmailLogin(login, account = session?.account) {
+  function acceptEmailLogin(login, email = session?.email, account = session?.account) {
     let expiresAt;
     try {
       expiresAt = Number(JSON.parse(Buffer.from(login.token.split('.')[1], 'base64url').toString('utf-8')).exp) * 1000;
@@ -228,14 +274,31 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
       throw new Error('官方账户接口未返回有效的邮箱登录令牌');
     }
     if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) throw new Error('邮箱登录令牌已过期，请重新登录');
-    persist({ kind: 'email', token: login.token, expiresAt, account });
+    persist({ kind: 'email', token: login.token, expiresAt, email, account });
     sessionError = '';
     scheduleRefresh(Math.min(EMAIL_REFRESH_INTERVAL, expiresAt - Date.now()));
   }
 
   // 保存账户展示字段，余额保留服务端字符串精度。
+  async function readAccount() {
+    const account = await request('/account', { method: 'GET', authenticated: true });
+    let team = null;
+    if (session.kind === 'email') {
+      const teams = await request('/yibiao/team/mine', { method: 'GET', authenticated: true, baseUrl: SERVICE_BASE_URL });
+      team = teams.find((item) => String(item.tenantId) === String(account.subjectId));
+    }
+    return { ...account, teamName: team?.name || null, isTeamAdmin: team?.isAdmin === true };
+  }
+
   function acceptAccount(account) {
-    persist({ ...session, account: { accountId: account.accountId, email: account.email || null, availablePoint: account.availablePoint } });
+    persist({ ...session, account: { ...account,
+      accountId: account.accountId == null ? null : String(account.accountId),
+      subjectId: String(account.subjectId),
+      availablePoint: String(account.availablePoint),
+      netRechargePoint: String(account.netRechargePoint),
+      totalConsumePoint: String(account.totalConsumePoint),
+    } });
+    balanceRevision++;
     loading = false;
     sessionError = '';
     publish();
@@ -264,8 +327,9 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
       }
       if (session.kind === 'email') acceptEmailLogin(await request('/openUser/refresh-token', { method: 'GET', authenticated: true, baseUrl: SERVICE_BASE_URL }));
       else acceptAnonymousToken(await request('/tokens/refresh', { authenticated: true }));
-      acceptAccount(await request('/account', { method: 'GET', authenticated: true }));
+      acceptAccount(await readAccount());
       if (!orderTrackingStarted) beginOrderTracking();
+      if (apiKeyError) await syncApiKey();
       return true;
     } catch (error) {
       handleAutomaticFailure(error);
@@ -299,6 +363,7 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
       scheduleQrCleanup();
       try {
         clientId = configStore.load().analytics_client_id;
+        configStore.save({ official_api_version: 4, text_model_profiles: { official: { api_key: '' } } });
         publish();
         if (fs.existsSync(sessionFile)) session = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'));
         if (session?.kind === 'email') {
@@ -307,8 +372,8 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
         }
         session = null;
         fs.rmSync(sessionFile, { force: true });
-        acceptAnonymousToken(await request('/clients/register', { body: { clientId } }));
-        acceptAccount(await request('/account', { method: 'GET', authenticated: true }));
+        acceptAnonymousToken(await request('/clients/login', { body: { clientId } }));
+        acceptAccount(await readAccount());
         beginOrderTracking();
         await syncApiKey();
       } catch (error) {
@@ -327,7 +392,12 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
   function loginWithEmail({ email, code }) {
     return enqueue(async () => {
       const result = await request('/email/login', { body: { email, code } });
-      acceptEmailLogin(result.login, result.account);
+      resetOrderTracking();
+      settlementTimers.forEach(clearTimeout);
+      settlementTimers.clear();
+      configStore.save({ official_api_version: 4, text_model_profiles: { official: { api_key: '' } } });
+      acceptEmailLogin(result, email, null);
+      acceptAccount(await readAccount());
       beginOrderTracking();
       await syncApiKey();
       return getState();
@@ -338,7 +408,12 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
   function bindEmail({ email, code }) {
     return enqueue(async () => {
       const result = await request('/email/bind', { body: { email, code }, authenticated: true });
-      acceptEmailLogin(result.login, result.account);
+      resetOrderTracking();
+      settlementTimers.forEach(clearTimeout);
+      settlementTimers.clear();
+      configStore.save({ official_api_version: 4, text_model_profiles: { official: { api_key: '' } } });
+      acceptEmailLogin(result, email, null);
+      acceptAccount(await readAccount());
       beginOrderTracking();
       await syncApiKey();
       return getState();
@@ -349,36 +424,85 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
   function refreshBalance() {
     if (refreshingBalance) return refreshingBalance;
     refreshingBalance = enqueue(async () => {
-      acceptAccount(await request('/account', { method: 'GET', authenticated: true }));
+      acceptAccount(await readAccount());
+      if (apiKeyError) await syncApiKey();
       return getState();
     }).finally(() => { refreshingBalance = null; });
     return refreshingBalance;
   }
 
-  // 兑换成功后查询当前余额；幂等响应中的余额是首次入账快照。
+  // 扣点异步入账；合并批量生成的通知并有限次回读，不以生成成功冒充扣点已完成。
+  function notifyAiCompleted(apiKey) {
+    if (closed || !session || apiKey !== configStore.load().text_model_profiles.official.api_key) return;
+    const identity = `${session.kind}:${session.account?.subjectId}`;
+    for (const delay of [500, 3000, 10000]) {
+      if (delay !== 10000 && settlementTimers.has(delay)) continue;
+      clearTimeout(settlementTimers.get(delay));
+      const timer = setTimeout(() => {
+        settlementTimers.delete(delay);
+        if (closed || `${session?.kind}:${session?.account?.subjectId}` !== identity) return;
+        void refreshBalance().catch(() => undefined);
+      }, delay);
+      settlementTimers.set(delay, timer);
+      timer.unref?.();
+    }
+  }
+
+  // 兑换成功后查询当前团队余额。
   function redeemCode(input) {
     return enqueue(async () => {
-      const result = await request('/redemptions', { body: input, authenticated: true });
+      const result = await request('/yibiao/redeem', { baseUrl: SERVICE_BASE_URL, body: input, authenticated: true });
       balanceNeedsRefresh = true;
       balanceRetryAt = 0;
       await refreshPaidBalance();
       scheduleOrderCheck();
-      return { redeemedPoint: result.redeemedPoint };
+      return { pointValue: String(result.pointValue) };
     });
   }
 
   // 提交一次开票申请，沿用当前账户的认证请求，不自动重发。
-  function createInvoiceApplication(input) {
+  function createInvoiceApplication({ orderNo, ...body }) {
+    return enqueue(() => request(`/orders/${encodeURIComponent(orderNo)}/invoice`, {
+      baseUrl: TEAM_RECHARGE_BASE_URL, body, authenticated: true,
+    }));
+  }
+
+  function getInvoiceApplication(orderNo) {
+    return enqueue(() => request(`/orders/${encodeURIComponent(orderNo)}/invoice`, {
+      baseUrl: TEAM_RECHARGE_BASE_URL, method: 'GET', authenticated: true,
+    }));
+  }
+
+  function getRefunds(orderNo) {
+    return enqueue(() => request(`/orders/${encodeURIComponent(orderNo)}/refunds`, {
+      baseUrl: TEAM_RECHARGE_BASE_URL, method: 'GET', authenticated: true,
+    }));
+  }
+
+  // 退款只显式提交一次，结果未确认时也重查原订单及余额，不自动重发。
+  function createRefund(orderNo) {
     return enqueue(async () => {
-      await request('/invoice-applications', { body: input, authenticated: true });
+      try {
+        return await request(`/orders/${encodeURIComponent(orderNo)}/refunds`, {
+          baseUrl: TEAM_RECHARGE_BASE_URL, authenticated: true,
+        });
+      } finally {
+        balanceNeedsRefresh = true;
+        balanceRetryAt = 0;
+        try { await readRechargeOrder(orderNo); } catch { orderRetryAt = Date.now() + 30000; }
+        await refreshPaidBalance();
+        scheduleOrderCheck();
+      }
     });
   }
 
   // 使用当前开放令牌查询商品，仅返回页面展示字段，不持久化商品列表。
   function getRechargeOptions() {
     return enqueue(async () => {
-      const options = await request('/recharge/options', { method: 'GET', authenticated: true });
-      return options.map(({ id, name, price, pointValue }) => ({ id, name, price, pointValue }));
+      const options = await request('/products', { baseUrl: RECHARGE_BASE_URL, method: 'GET', authenticated: true });
+      return options.map(({ id, name, payAmountFen, rechargePoint }) => ({
+        id: String(id), name, amountYuan: amountYuan(payAmountFen), rechargePoint: String(rechargePoint),
+      }));
     });
   }
 
@@ -418,12 +542,14 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
 
   // 广播服务端状态；支付成功或关单后立即清除当前账户的二维码。
   function recordOrder(order) {
-    if (order.payStatus === 'SUCCESS' && orderStatuses.get(order.id) !== 'SUCCESS') balanceNeedsRefresh = true;
-    orderStatuses.set(order.id, order.payStatus);
-    if (order.payStatus === 'WAITING') pendingOrders.add(order.id);
-    else {
-      pendingOrders.delete(order.id);
-      const retained = qrCodes.filter((item) => item.accountId !== session.account.accountId || item.orderId !== order.id);
+    const previous = orderStatuses.get(order.orderNo);
+    if ((order.status === 'PAID' && previous?.status !== 'PAID')
+      || (previous && previous.refundStatus !== order.refundStatus)) balanceNeedsRefresh = true;
+    orderStatuses.set(order.orderNo, { status: order.status, refundStatus: order.refundStatus });
+    if (order.status === 'WAITING' || order.refundStatus === 'PENDING') pendingOrders.add(order.orderNo);
+    else pendingOrders.delete(order.orderNo);
+    if (order.status !== 'WAITING') {
+      const retained = qrCodes.filter((item) => item.orderNo !== order.orderNo);
       if (retained.length !== qrCodes.length) { qrCodes = retained; saveQrCodes(); }
     }
     orderListeners.forEach((listener) => listener({ ...order, qrCode: null }));
@@ -433,7 +559,7 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
   async function refreshPaidBalance() {
     if (!balanceNeedsRefresh || !session || closed || Date.now() < balanceRetryAt) return;
     try {
-      acceptAccount(await request('/account', { method: 'GET', authenticated: true }));
+      acceptAccount(await readAccount());
       balanceNeedsRefresh = false;
       balanceRetryAt = 0;
     } catch {
@@ -443,17 +569,35 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
   }
 
   // 列表以服务端为准，同时恢复其中尚未完成的订单。
-  async function readRechargeOrders() {
-    const orders = await request('/recharge/orders', { method: 'GET', authenticated: true });
+  async function readRechargeOrders(query = { page: 1 }) {
+    const items = await request(`/orders?${pageQuery(query)}`, { baseUrl: RECHARGE_BASE_URL, method: 'GET', authenticated: true });
+    const orders = items.slice(0, PAGE_SIZE).map(orderView);
     orders.forEach(recordOrder);
+    await refreshPaidBalance();
+    return { records: orders, current: query.page, size: PAGE_SIZE, hasMore: items.length > PAGE_SIZE };
+  }
+
+  // 重启后分页恢复本人所有来源的未完订单，不把列表第一页当作全部订单。
+  async function restoreOrderTracking() {
+    const sources = [null, ...(session.kind === 'email' ? session.account.sources.map((item) => item.sourceAccountId) : [])];
+    for (const sourceAccountId of sources) {
+      for (let offset = 0; ; offset += 100) {
+        const query = new URLSearchParams({ offset: String(offset), limit: '100' });
+        if (sourceAccountId) query.set('sourceAccountId', String(sourceAccountId));
+        const orders = await request(`/orders?${query}`, { baseUrl: RECHARGE_BASE_URL, method: 'GET', authenticated: true });
+        orders.forEach((order) => recordOrder(orderView(order)));
+        if (orders.length < 100) break;
+      }
+    }
     reloadOrders = false;
     await refreshPaidBalance();
-    return orders;
   }
 
   // 手动查询和后台确认走同一路径，成功状态必定触发余额查询。
-  async function readRechargeOrder(id) {
-    const order = await request(`/recharge/orders/${id}`, { method: 'GET', authenticated: true });
+  async function readRechargeOrder(orderNo, refresh = false) {
+    const order = orderView(await request(`/orders/${encodeURIComponent(orderNo)}${refresh ? '/refresh' : ''}`, {
+      baseUrl: RECHARGE_BASE_URL, method: refresh ? 'POST' : 'GET', authenticated: true,
+    }));
     recordOrder(order);
     await refreshPaidBalance();
     return order;
@@ -464,7 +608,7 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
     if (!session || session.expiresAt <= Date.now()) { clearSession('登录已失效，请重新登录官方账户'); return; }
     orderRetryAt = 0;
     try {
-      if (reloadOrders) await readRechargeOrders();
+      if (reloadOrders) await restoreOrderTracking();
       else {
         for (const id of [...pendingOrders]) await readRechargeOrder(id);
         await refreshPaidBalance();
@@ -477,13 +621,14 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
   }
 
   // 创建只执行一次；失败后查询列表确认可能已落库的订单，不自动重发下单。
-  function createRechargeOrder({ optionId }) {
+  function createRechargeOrder(input) {
     if (creatingOrder) return creatingOrder;
     creatingOrder = enqueue(async () => {
       try {
-        const order = await request('/recharge/orders', { body: { optionId, quantity: 1 }, authenticated: true });
-        if (order.payStatus === 'WAITING' && order.qrCode) {
-          qrCodes.push({ accountId: session.account.accountId, orderId: order.id, qrCode: order.qrCode, cachedAt: Date.now() });
+        const created = await request('/orders', { baseUrl: RECHARGE_BASE_URL, body: input, authenticated: true });
+        const order = { ...orderView(created.order), qrCode: created.qrCode || null };
+        if (order.status === 'WAITING' && order.qrCode) {
+          qrCodes.push({ orderNo: order.orderNo, qrCode: order.qrCode, cachedAt: Date.now() });
           saveQrCodes();
         }
         recordOrder(order);
@@ -501,38 +646,34 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
   }
 
   // 手动刷新列表后继续监控待支付订单。
-  function getRechargeOrders() {
+  function getRechargeOrders(query) {
     return enqueue(async () => {
-      try { return await readRechargeOrders(); }
+      try { return await readRechargeOrders(query); }
       finally { scheduleOrderCheck(); }
     });
   }
 
   // 两种登录身份共用消费接口，凭据及查询范围由现有账户鉴权处理。
-  function getTransactions(page) {
+  function getTransactions(query) {
     return enqueue(async () => {
-      const data = await request(`/account/consume-records?current=${page}&size=5`, {
-        method: 'GET', authenticated: true,
+      const data = await request(`/anonymous/yibiao/finance/consumptions?${pageQuery(query)}`, {
+        baseUrl: SERVICE_BASE_URL, method: 'GET', authenticated: true,
       });
-      const current = Number(data?.current);
-      const size = Number(data?.size);
-      const total = Number(data?.total);
-      if (!Array.isArray(data?.records) || !Number.isSafeInteger(current) || current < 1
-        || !Number.isSafeInteger(size) || size < 1 || !Number.isSafeInteger(total) || total < 0) {
-        throw new Error('官方流水接口返回的分页数据不完整，请重试');
-      }
-      return { records: data.records, current, size, total };
+      return { records: data.slice(0, PAGE_SIZE).map((item) => ({ ...item,
+        id: String(item.id), consumePoint: String(item.consumePoint),
+        availableAfter: item.availableAfter == null ? null : String(item.availableAfter),
+      })), current: query.page, size: PAGE_SIZE, hasMore: data.length > PAGE_SIZE };
     });
   }
 
   // 先查询服务端状态，仅为仍待支付的订单附上当前账户的有效本地缓存。
-  function getRechargeOrder(id) {
+  function getRechargeOrder(orderNo, refresh = false) {
     return enqueue(async () => {
       try {
-        const order = await readRechargeOrder(id);
+        const order = await readRechargeOrder(orderNo, refresh);
         pruneQrCodes();
-        const cached = order.payStatus === 'WAITING'
-          ? qrCodes.find((item) => item.accountId === session?.account?.accountId && item.orderId === order.id)
+        const cached = order.status === 'WAITING'
+          ? qrCodes.find((item) => item.orderNo === order.orderNo)
           : null;
         return { ...order, qrCode: cached?.qrCode || null };
       }
@@ -540,14 +681,18 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
     });
   }
 
-  // 关单后重新查询权威状态；拒绝关单时也查询，处理付款与关单并发。
-  function closeRechargeOrder(id) {
+  // 关单仅提交一次；以服务端实际状态更新二维码和余额，失败时只重查原单。
+  function closeRechargeOrder(orderNo) {
     return enqueue(async () => {
       try {
-        await request(`/recharge/orders/${id}/close`, { authenticated: true });
-        return await readRechargeOrder(id);
+        const order = orderView(await request(`/orders/${encodeURIComponent(orderNo)}/close`, {
+          baseUrl: RECHARGE_BASE_URL, authenticated: true,
+        }));
+        recordOrder(order);
+        await refreshPaidBalance();
+        return order;
       } catch (error) {
-        try { await readRechargeOrder(id); } catch { orderRetryAt = Date.now() + 30000; }
+        try { await readRechargeOrder(orderNo); } catch { orderRetryAt = Date.now() + 30000; }
         throw error;
       } finally {
         scheduleOrderCheck();
@@ -573,6 +718,8 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
     resetOrderTracking();
     clearTimeout(refreshTimer);
     clearTimeout(qrCleanupTimer);
+    settlementTimers.forEach(clearTimeout);
+    settlementTimers.clear();
     powerMonitor.removeListener('resume', handleResume);
     shutdown.abort();
     listeners.clear();
@@ -580,8 +727,9 @@ function createOfficialAccountService({ app, configStore, powerMonitor, fetchImp
     return tail;
   }
 
-  return { start, getState, onChanged, sendEmailCode, loginWithEmail, bindEmail, refreshBalance, getRechargeOptions,
-    redeemCode, createInvoiceApplication, createRechargeOrder, getRechargeOrders, getTransactions, getRechargeOrder, closeRechargeOrder, onRechargeOrderChanged, close };
+  return { start, getState, onChanged, sendEmailCode, loginWithEmail, bindEmail, refreshBalance, notifyAiCompleted, getRechargeOptions,
+    redeemCode, createInvoiceApplication, getInvoiceApplication, getRefunds, createRefund,
+    createRechargeOrder, getRechargeOrders, getTransactions, getRechargeOrder, closeRechargeOrder, onRechargeOrderChanged, close };
 }
 
 module.exports = { createOfficialAccountService };

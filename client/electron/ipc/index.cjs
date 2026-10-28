@@ -384,7 +384,7 @@ function registerIpcHandlers({ app, mainWindow, checkAndDownloadUpdate, triggerU
   initLocalImageRenderService({ configStore });
   const licenseService = createLicenseService({ app, configStore });
   const officialAccountService = createOfficialAccountService({ app, configStore, powerMonitor });
-  const aiService = createAiService({ app, configStore });
+  const aiService = createAiService({ app, configStore, onOfficialRequestComplete: officialAccountService.notifyAiCompleted });
   const developerExpansionReplaceTestService = createDeveloperExpansionReplaceTestService({ aiService });
   const developerLayoutFigureService = createDeveloperLayoutFigureService({ app, aiService });
   const donationService = createDonationService({

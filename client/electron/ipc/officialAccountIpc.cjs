@@ -4,6 +4,9 @@ const { BrowserWindow, ipcMain } = require('electron');
 function registerOfficialAccountIpc({ officialAccountService }) {
   ipcMain.handle('official-account:redeem-code', (_event, input) => officialAccountService.redeemCode(input));
   ipcMain.handle('official-account:create-invoice-application', (_event, input) => officialAccountService.createInvoiceApplication(input));
+  ipcMain.handle('official-account:get-invoice-application', (_event, orderNo) => officialAccountService.getInvoiceApplication(orderNo));
+  ipcMain.handle('official-account:get-refunds', (_event, orderNo) => officialAccountService.getRefunds(orderNo));
+  ipcMain.handle('official-account:create-refund', (_event, orderNo) => officialAccountService.createRefund(orderNo));
   ipcMain.handle('official-account:get-state', () => officialAccountService.getState());
   ipcMain.handle('official-account:refresh-balance', () => officialAccountService.refreshBalance());
   ipcMain.handle('official-account:send-email-code', (_event, input) => officialAccountService.sendEmailCode(input));
@@ -11,10 +14,11 @@ function registerOfficialAccountIpc({ officialAccountService }) {
   ipcMain.handle('official-account:bind-email', (_event, input) => officialAccountService.bindEmail(input));
   ipcMain.handle('official-account:get-recharge-options', () => officialAccountService.getRechargeOptions());
   ipcMain.handle('official-account:create-recharge-order', (_event, input) => officialAccountService.createRechargeOrder(input));
-  ipcMain.handle('official-account:get-recharge-orders', () => officialAccountService.getRechargeOrders());
-  ipcMain.handle('official-account:get-transactions', (_event, page) => officialAccountService.getTransactions(page));
-  ipcMain.handle('official-account:get-recharge-order', (_event, id) => officialAccountService.getRechargeOrder(id));
-  ipcMain.handle('official-account:close-recharge-order', (_event, id) => officialAccountService.closeRechargeOrder(id));
+  ipcMain.handle('official-account:get-recharge-orders', (_event, query) => officialAccountService.getRechargeOrders(query));
+  ipcMain.handle('official-account:get-transactions', (_event, query) => officialAccountService.getTransactions(query));
+  ipcMain.handle('official-account:get-recharge-order', (_event, orderNo) => officialAccountService.getRechargeOrder(orderNo));
+  ipcMain.handle('official-account:refresh-recharge-order', (_event, orderNo) => officialAccountService.getRechargeOrder(orderNo, true));
+  ipcMain.handle('official-account:close-recharge-order', (_event, orderNo) => officialAccountService.closeRechargeOrder(orderNo));
   officialAccountService.onRechargeOrderChanged((order) => {
     BrowserWindow.getAllWindows().forEach((window) => {
       if (!window.webContents.isDestroyed()) window.webContents.send('official-account:order', order);

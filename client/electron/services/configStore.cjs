@@ -3,9 +3,10 @@ const path = require('node:path');
 const { getConfigFilePath } = require('../utils/paths.cjs');
 const { createAnalyticsClientId } = require('../utils/machineIdentity.cjs');
 const { defaultExportFormat, normalizeExportFormat } = require('./exportFormatDefaults.cjs');
+const { AI_BASE_URL } = require('./officialApi.cjs');
 
 const textModelProviders = ['official', 'jinlong', 'volcengine', 'deepseek', 'agnes', 'custom'];
-const imageModelProviders = ['jinlong', 'volcengine', 'google-ai-studio', 'agnes', 'custom', 'comfyui'];
+const imageModelProviders = ['official', 'jinlong', 'volcengine', 'google-ai-studio', 'agnes', 'custom', 'comfyui'];
 const aiRequestModes = ['normal', 'stream'];
 const updateChannels = ['github', 'cloudflare', 'atomgit'];
 const DEFAULT_TEXT_CONTEXT_LENGTH_LIMIT = 400000;
@@ -22,7 +23,7 @@ const googleImageSizes = ['512', '1K', '2K', '4K'];
 const agnesImageRatios = ['1:1', '3:4', '4:3', '16:9', '9:16', '2:3', '3:2', '21:9'];
 
 const textProviderBaseUrls = {
-  official: 'https://v3.yibiao.pro/qhp-yibiao/anonymous/yibiao/openai/v1',
+  official: AI_BASE_URL,
   jinlong: 'https://jlaudeapi.com/v1',
   volcengine: 'https://ark.cn-beijing.volces.com/api/v3',
   deepseek: 'https://api.deepseek.com',
@@ -34,7 +35,7 @@ const defaultTextModelProfiles = {
   official: {
     api_key: '',
     base_url: textProviderBaseUrls.official,
-    model_name: 'yibiao-text',
+    model_name: 'TEXT_GENERATION',
     multimodal_enabled: true,
     reasoning_effort: '',
     context_length_limit: 258000,
@@ -112,6 +113,18 @@ const defaultTextModelProfiles = {
 };
 
 const defaultImageModelProfiles = {
+  official: {
+    provider: 'official',
+    base_url: AI_BASE_URL,
+    api_key: '',
+    model_name: 'IMAGE_GENERATION',
+    image_size: '1024x1024',
+    request_mode: 'stream',
+    concurrency_limit: DEFAULT_IMAGE_CONCURRENCY_LIMIT,
+    status: 'untested',
+    tested_at: '',
+    last_error: '',
+  },
   jinlong: {
     provider: 'jinlong',
     base_url: 'https://img-api.jlaudeapi.com/v1',
@@ -477,11 +490,21 @@ function normalizeConfig(config) {
     textModelProfiles.custom = textProfileFromUnknownProvider(source, rawTextProvider, textModelProfiles.custom);
   }
   const officialApiModelType = source.official_api_model_type ?? defaultConfig.official_api_model_type;
+  // 官方协议固定为 V4；历史数据由后端迁移，本机旧 Key 须登录后重新取得。
+  Object.assign(textModelProfiles.official, {
+    api_key: source.official_api_version === 4 ? textModelProfiles.official.api_key : '',
+    model_name: officialApiModelType === 'high-quality' ? 'REASONING' : 'TEXT_GENERATION',
+    request_mode: 'stream',
+  });
   const activeTextProfile = textModelProfiles[textModelProvider];
   const sourceImageModel = source.image_model && typeof source.image_model === 'object' ? source.image_model : {};
   const imageModelProvider = isImageModelProvider(sourceImageModel.provider) ? sourceImageModel.provider : defaultConfig.image_model.provider;
   const imageModelProfiles = normalizeImageModelProfiles(source.image_model_profiles);
   imageModelProfiles[imageModelProvider] = normalizeImageModelProfile(imageModelProvider, sourceImageModel);
+  Object.assign(imageModelProfiles.official, {
+    api_key: textModelProfiles.official.api_key,
+    model_name: 'IMAGE_GENERATION',
+  });
   const activeImageProfile = imageModelProfiles[imageModelProvider];
   const hasGpuHardwareAccelerationEnabled = typeof source.gpu_hardware_acceleration_enabled === 'boolean';
   const hasGpuHardwareAccelerationConfigured = typeof source.gpu_hardware_acceleration_configured === 'boolean';
@@ -496,6 +519,7 @@ function normalizeConfig(config) {
     ...defaultConfig,
     text_model_provider: textModelProvider,
     official_api_model_type: officialApiModelType,
+    official_api_version: source.official_api_version === 4 ? 4 : 0,
     text_model_profiles: textModelProfiles,
     api_key: activeTextProfile.api_key,
     base_url: activeTextProfile.base_url,

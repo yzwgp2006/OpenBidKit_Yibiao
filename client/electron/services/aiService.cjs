@@ -27,6 +27,7 @@ const {
 } = require('../utils/aiLog.cjs');
 const textTokenStatsStore = require('./textTokenStatsStore.cjs');
 const { buildImageStylePrompt } = require('./aiImageStyles.cjs');
+const { AI_BASE_URL } = require('./officialApi.cjs');
 const { normalizeTokenUsage } = textTokenStatsStore;
 
 const AI_REQUEST_TIMEOUT_MS = 600000;
@@ -38,6 +39,12 @@ const ANALYTICS_ENDPOINT = 'https://analytics.agnet.top/track';
 const ANALYTICS_PROJECT_NAME = 'yibiao-client';
 const MODEL_INFO_ENDPOINT = 'https://analytics.agnet.top/model-info';
 const OPENAI_IMAGE_PROVIDER_META = {
+  official: {
+    label: '易标官方 API',
+    defaultBaseUrl: AI_BASE_URL,
+    logProvider: 'official',
+    modelLabel: '生图模型名称',
+  },
   jinlong: {
     label: '金龙中转站',
     defaultBaseUrl: 'https://img-api.jlaudeapi.com/v1',
@@ -151,6 +158,7 @@ function normalizeRequestTimeoutMs(request) {
 }
 
 function normalizeTextRequestMode(config) {
+  if (config?.text_model_provider === 'official') return 'stream';
   return config?.request_mode === 'normal' ? 'normal' : 'stream';
 }
 
@@ -265,6 +273,11 @@ function createOpenAICompatibleImageRequestBody(provider, imageConfig, prompt, r
   const requestMode = normalizeImageRequestMode(imageConfig);
   const model = String(imageConfig?.model_name || '').trim();
   const size = normalizeOpenAICompatibleImageSize(imageConfig, requestSize);
+
+  // V4 使用逻辑模型且禁止 response_format；URL/Base64 由服务端实际结果决定。
+  if (provider === 'official') {
+    return { model: 'IMAGE_GENERATION', prompt, size, n: 1, stream: requestMode === 'stream' };
+  }
 
   if (provider !== 'agnes') {
     return {
@@ -420,8 +433,8 @@ function getImageModelAvailability(config) {
     return { available: true, status: 'available', message: '生图模型可用' };
   }
 
-  if (!imageConfig.api_key) {
-    return { available: false, status: 'unavailable', message: '请先填写生图模型 API Key' };
+    if (!imageConfig.api_key) {
+    return { available: false, status: 'unavailable', message: imageConfig.provider === 'official' ? '请先登录官方账户并取得可用 Key' : '请先填写生图模型 API Key' };
   }
 
   if (!imageConfig.model_name) {
@@ -982,13 +995,13 @@ async function fetchChatCompletion(app, config, body, options = {}) {
   }
 }
 
-async function ensureTextAiResponseOk(response, fallbackMessage) {
+async function ensureTextAiResponseOk(response, fallbackMessage, config) {
   if (response.ok) {
     return;
   }
 
   throw await createAiHttpErrorFromResponse(response, fallbackMessage, {
-    source: 'text-model',
+    source: config?.text_model_provider === 'official' ? 'official-text-model' : 'text-model',
     responseFormatUnsupportedChecker: isResponseFormatUnsupported,
   });
 }
@@ -1051,10 +1064,18 @@ async function readSseJsonDataLine(line, state, options) {
   }
 
   if (payload?.error && options.throwOnPayloadError !== false) {
+    if (options.official) {
+      const code = payload.error.code;
+      const status = code === 'insufficient_balance' ? 402 : code === 'invalid_api_key' ? 401 : 502;
+      const error = await createAiHttpErrorFromResponse(new Response(data, { status }), options.failureMessage, { source: 'official-stream' });
+      error.raw_sse_data = data;
+      // 已进入交付流的失败不自动重放可能已经计费的模型请求。
+      throw markAiRequestError(error, { retryable: false });
+    }
     const streamError = new Error(normalizeStreamPayloadError(payload.error, options.failureMessage || 'AI 流式请求失败'));
     streamError.raw_response_payload = payload;
     streamError.raw_sse_data = data;
-    throw markAiRequestError(streamError, { retryable: true });
+    throw markAiRequestError(streamError, { retryable: !options.official });
   }
 
   await Promise.resolve(options.onPayload?.(payload));
@@ -1069,45 +1090,60 @@ async function readSseJsonStream(response, options = {}) {
   const decoder = new TextDecoder('utf-8');
   const state = { done: false };
   let buffer = '';
-
-  while (!state.done) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
-    }
-
-    if (value?.byteLength) notifyAiResponse();
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split(/\r?\n/);
-    buffer = lines.pop() || '';
-
-    for (const line of lines) {
+  let dataLines = [];
+  const readLine = async (line) => {
+    if (!options.official) {
       await readSseJsonDataLine(line, state, options);
-      if (state.done) {
-        break;
+    } else if (line === '') {
+      if (dataLines.length) await readSseJsonDataLine(`data: ${dataLines.join('\n')}`, state, options);
+      dataLines = [];
+    } else if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).replace(/^ /, ''));
+    }
+  };
+
+  try {
+    while (!state.done) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value?.byteLength) notifyAiResponse();
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        await readLine(line);
+        if (state.done) break;
       }
     }
-  }
-
-  buffer += decoder.decode();
-  if (!state.done && buffer.trim()) {
-    const lines = buffer.split(/\r?\n/);
-    for (const line of lines) {
-      await readSseJsonDataLine(line, state, options);
-      if (state.done) {
-        break;
+    buffer += decoder.decode();
+    if (!state.done && buffer.trim()) {
+      for (const line of buffer.split(/\r?\n/)) {
+        await readLine(line);
+        if (state.done) break;
       }
     }
+    if (!state.done) await readLine('');
+    if (options.requireDone && !state.done) {
+      throw markAiRequestError(new Error('官方 AI 响应中断，未收到完成标记，请查看消费记录后重试'), { retryable: false });
+    }
+  } catch (error) {
+    if (options.official) markAiRequestError(error, { retryable: false });
+    throw error;
+  } finally {
+    try { await reader.cancel(); } catch {}
+    reader.releaseLock();
   }
 }
 
-async function readOpenAIChatStream(response) {
+async function readOpenAIChatStream(response, official = false) {
   const state = { usage: null, contentParts: [], finishReason: null };
 
   await readSseJsonStream(response, {
     unreadableMessage: 'AI 流式响应不可读',
     parseErrorMessage: 'AI 流式响应解析失败',
     failureMessage: 'AI 流式请求失败',
+    official,
+    requireDone: official,
     onPayload(payload) {
       if (payload?.usage) {
         state.usage = payload.usage;
@@ -1136,7 +1172,7 @@ async function readOpenAIChatStream(response) {
 
 async function requestTextAiNormal(app, config, requestBody, options = {}) {
   const response = await fetchChatCompletion(app, config, requestBody, { signal: options.signal });
-  await ensureTextAiResponseOk(response, 'AI 请求失败');
+  await ensureTextAiResponseOk(response, 'AI 请求失败', config);
   let responseData = null;
   try {
     responseData = await response.json();
@@ -1153,8 +1189,8 @@ async function requestTextAiNormal(app, config, requestBody, options = {}) {
 
 async function requestTextAiStream(app, config, requestBody, options = {}) {
   const response = await fetchChatCompletion(app, config, requestBody, { signal: options.signal });
-  await ensureTextAiResponseOk(response, 'AI 请求失败');
-  return readOpenAIChatStream(response);
+  await ensureTextAiResponseOk(response, 'AI 请求失败', config);
+  return readOpenAIChatStream(response, config.text_model_provider === 'official');
 }
 
 async function requestTextAi(app, config, requestBody, options = {}) {
@@ -1235,18 +1271,23 @@ function appendOpenAICompatibleImagePayload(payload, state) {
   appendOpenAICompatibleImageItem(state, payload);
 }
 
-async function readOpenAICompatibleImageStream(response) {
+async function readOpenAICompatibleImageStream(response, options = {}) {
   const state = { images: [], errors: [], completed: null, usage: null };
 
   await readSseJsonStream(response, {
     unreadableMessage: '生图流式响应不可读',
     parseErrorMessage: '生图流式响应解析失败',
     failureMessage: '生图流式请求失败',
-    throwOnPayloadError: false,
+    throwOnPayloadError: Boolean(options.official),
+    official: options.official,
     onPayload(payload) {
       appendOpenAICompatibleImagePayload(payload, state);
     },
   });
+
+  if (options.official && (!state.completed || !state.images.length)) {
+    throw markAiRequestError(new Error('官方图片响应中断，未收到完整图片，请查看消费记录后重试'), { retryable: false });
+  }
 
   return {
     stream: true,
@@ -1261,7 +1302,7 @@ async function requestOpenAICompatibleImageData(baseUrl, apiKey, requestBody, fa
   return withAiResponseActivity(async () => {
     const response = await fetchOpenAICompatibleImageResponse(baseUrl, apiKey, requestBody, fallbackMessage, options);
     if (requestBody.stream) {
-      return readOpenAICompatibleImageStream(response);
+      return readOpenAICompatibleImageStream(response, { official: baseUrl === AI_BASE_URL });
     }
     try {
       return await response.json();
@@ -1533,7 +1574,7 @@ async function runAgentChatCompletionWithConfig(app, config, request) {
     });
     await Promise.resolve(request.onRequestStart?.({ config, requestBody, requestId }));
     const response = await fetchChatCompletion(app, config, requestBody, { signal: request.signal });
-    await ensureTextAiResponseOk(response, 'AI 请求失败');
+    await ensureTextAiResponseOk(response, 'AI 请求失败', config);
     const result = await request.consumeResponse(response, {
       config,
       requestBody,
@@ -1620,7 +1661,7 @@ async function testOpenAICompatibleImageModel(app, config, provider) {
           imageConfig.api_key,
           requestBody,
           `${meta.label}生图测试失败`,
-          { signal },
+          { signal, source: `${meta.logProvider}-image-model` },
         ),
         AI_REQUEST_TIMEOUT_MS,
       ));
@@ -2433,7 +2474,7 @@ async function generateImageWithConfig(app, config, request) {
     throw new Error(availability.message);
   }
 
-  if (config.image_model?.provider === 'jinlong' || config.image_model?.provider === 'volcengine' || config.image_model?.provider === 'agnes' || config.image_model?.provider === 'custom') {
+  if (config.image_model?.provider === 'official' || config.image_model?.provider === 'jinlong' || config.image_model?.provider === 'volcengine' || config.image_model?.provider === 'agnes' || config.image_model?.provider === 'custom') {
     return generateOpenAICompatibleImage(app, config, request, config.image_model.provider);
   }
 
@@ -2448,7 +2489,19 @@ async function generateImageWithConfig(app, config, request) {
   throw new Error('当前生图服务商暂不支持正文配图');
 }
 
-function createAiService({ app, configStore }) {
+function createAiService({ app, configStore, onOfficialRequestComplete }) {
+  async function withAccountRefresh(config, type, runner) {
+    const official = type === 'image' ? config.image_model?.provider === 'official' : config.text_model_provider === 'official';
+    const apiKey = type === 'image' ? config.image_model?.api_key : config.api_key;
+    try {
+      return await runner();
+    } finally {
+      if (official && apiKey) {
+        try { await onOfficialRequestComplete?.(apiKey); }
+        catch { console.warn('[official-account] AI 完成后的余额刷新未能安排'); }
+      }
+    }
+  }
   const textRequestQueue = createAiRequestQueue({
     defaultLimit: 10,
     getLimit() {
@@ -2499,14 +2552,14 @@ function createAiService({ app, configStore }) {
     async chat(request) {
       return enqueueTextRequest(request, () => {
         const config = configStore.load();
-        return chatWithConfig(app, config, request);
+        return withAccountRefresh(config, 'text', () => chatWithConfig(app, config, request));
       }, { signal: request?.signal });
     },
 
     async runAgentChatCompletion(request) {
       return enqueueTextRequest(request, () => {
         const config = configStore.load();
-        return runAgentChatCompletionWithConfig(app, config, request);
+        return withAccountRefresh(config, 'text', () => runAgentChatCompletionWithConfig(app, config, request));
       }, {
         signal: request?.signal,
         // Pi Session 保留回合级原生重试，本队列只负责统一调度和并发控制。
@@ -2517,21 +2570,21 @@ function createAiService({ app, configStore }) {
     async requestJson(request) {
       return enqueueTextRequest(request, () => {
         const config = configStore.load();
-        return collectJsonResponseWithConfig(app, config, request);
+        return withAccountRefresh(config, 'text', () => collectJsonResponseWithConfig(app, config, request));
       }, { signal: request?.signal });
     },
 
     async collectJsonResponse(request) {
       return enqueueTextRequest(request, () => {
         const config = configStore.load();
-        return collectJsonResponseWithConfig(app, config, request);
+        return withAccountRefresh(config, 'text', () => collectJsonResponseWithConfig(app, config, request));
       }, { signal: request?.signal });
     },
 
     async parseJsonResponseContent(request, content) {
       return enqueueTextRequest(request, () => {
         const config = configStore.load();
-        return parseOrRepairJsonResponseWithConfig(app, config, request, content);
+        return withAccountRefresh(config, 'text', () => parseOrRepairJsonResponseWithConfig(app, config, request, content));
       }, { signal: request?.signal });
     },
 
@@ -2596,8 +2649,12 @@ function createAiService({ app, configStore }) {
         analytics_created_at: config.analytics_created_at || currentConfig.analytics_created_at,
       };
 
-      if (trackedConfig.image_model?.provider === 'jinlong' || trackedConfig.image_model?.provider === 'volcengine' || trackedConfig.image_model?.provider === 'agnes' || trackedConfig.image_model?.provider === 'custom') {
-        return testOpenAICompatibleImageModel(app, trackedConfig, trackedConfig.image_model.provider);
+      if (trackedConfig.image_model?.provider === 'official') {
+        trackedConfig.image_model = { ...trackedConfig.image_model,
+          base_url: AI_BASE_URL, model_name: 'IMAGE_GENERATION', api_key: currentConfig.text_model_profiles.official.api_key };
+      }
+      if (trackedConfig.image_model?.provider === 'official' || trackedConfig.image_model?.provider === 'jinlong' || trackedConfig.image_model?.provider === 'volcengine' || trackedConfig.image_model?.provider === 'agnes' || trackedConfig.image_model?.provider === 'custom') {
+        return withAccountRefresh(trackedConfig, 'image', () => testOpenAICompatibleImageModel(app, trackedConfig, trackedConfig.image_model.provider));
       }
 
       if (trackedConfig.image_model?.provider === 'google-ai-studio') {
@@ -2632,7 +2689,7 @@ function createAiService({ app, configStore }) {
     async generateImage(request) {
       return enqueueImageRequest(request, () => {
         const config = configStore.load();
-        return generateImageWithConfig(app, config, request);
+        return withAccountRefresh(config, 'image', () => generateImageWithConfig(app, config, request));
       });
     },
 

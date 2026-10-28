@@ -9,6 +9,7 @@ const {
   markAiRequestError,
 } = require('../../utils/aiRetry.cjs');
 const {
+  createAiHttpErrorFromResponse,
   emitAiHttpErrorToWindows,
 } = require('../../utils/aiHttpError.cjs');
 const { normalizeTokenUsage } = require('../textTokenStatsStore.cjs');
@@ -568,16 +569,17 @@ function createStreamResponseData(content, usage, streamMeta) {
   };
 }
 
-function createSseResponseCollector() {
+function createSseResponseCollector(official = false) {
   let buffer = '';
   let usage = null;
   let parsedEventCount = 0;
   let sawDone = false;
   let streamError = null;
+  let dataLines = [];
   const contentParts = [];
   const finishReasons = [];
 
-  function processLine(line) {
+  function processData(line) {
     const trimmed = String(line || '').trim();
     if (!trimmed.startsWith('data:')) return;
 
@@ -601,13 +603,23 @@ function createSseResponseCollector() {
         const source = payload.error;
         streamError = {
           type: String(source?.type || source?.code || payload?.type || 'stream_error'),
+          code: String(source?.code || ''),
           message: String(source?.message || payload?.message || (typeof source === 'string' ? source : JSON.stringify(source))),
         };
       }
       appendPayloadContent(payload, contentParts);
     } catch {
+      if (official) streamError = { type: 'stream_error', code: 'AI_STREAM_INVALID', message: '官方 AI 流式响应解析失败' };
       // 单行解析失败不影响流式转发。
     }
+  }
+
+  function processLine(line) {
+    if (!official) { processData(line); return; }
+    if (line === '') {
+      if (dataLines.length) processData(`data: ${dataLines.join('\n')}`);
+      dataLines = [];
+    } else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
   }
 
   return {
@@ -622,6 +634,7 @@ function createSseResponseCollector() {
         buffer.split(/\r?\n/).forEach(processLine);
       }
       buffer = '';
+      if (official) processLine('');
       const content = contentParts.join('').trim();
       const streamMeta = {
         parsed_event_count: parsedEventCount,
@@ -647,7 +660,7 @@ function createUsageCapturingStream(source, onDone, options = {}) {
 
   const reader = source.getReader();
   const decoder = new TextDecoder('utf-8');
-  const collector = createSseResponseCollector();
+  const collector = createSseResponseCollector(options.official);
 
   return new ReadableStream({
     async pull(controller) {
@@ -683,7 +696,7 @@ function createUsageCapturingStream(source, onDone, options = {}) {
     },
     async cancel(reason) {
       collector.push(decoder.decode());
-      options.onCancel?.(reason, collector.flush());
+      await options.onCancel?.(reason, collector.flush());
       try { await reader.cancel(reason); } catch {}
     },
   });
@@ -795,14 +808,25 @@ async function prepareProxyResponse({ app, config, runtimeMeta, requestId, reque
       });
       rejectCompletion(error);
     };
-    const createStreamFailure = (capture, fallbackMessage) => {
-      const error = markAiRequestError(new Error(capture?.streamError?.message || fallbackMessage), { retryable: true });
-      error.code = capture?.streamError?.type || 'AI_STREAM_INCOMPLETE';
+    const official = config.text_model_provider === 'official';
+    const createStreamFailure = async (capture, fallbackMessage) => {
+      let error;
+      if (official && capture?.streamError) {
+        const code = capture.streamError.code;
+        error = await createAiHttpErrorFromResponse(new Response(JSON.stringify({ error: capture.streamError }), {
+          status: code === 'insufficient_balance' ? 402 : code === 'invalid_api_key' ? 401 : 502,
+        }), fallbackMessage, { source: 'official-agent-stream' });
+      } else error = new Error(capture?.streamError?.message || fallbackMessage);
+      markAiRequestError(error, { retryable: !official });
+      error.code = capture?.streamError?.code || capture?.streamError?.type || 'AI_STREAM_INCOMPLETE';
+      error.officialStream = official;
       return error;
     };
-    const body = createUsageCapturingStream(response.body, (capture) => {
-      if (capture.streamError) {
-        finalizeStreamFailure(createStreamFailure(capture, 'AI 流式响应返回错误'), capture);
+    const body = createUsageCapturingStream(response.body, async (capture) => {
+      if (capture.streamError || (official && !capture.streamMeta.saw_done)) {
+        const error = await createStreamFailure(capture, '官方 AI 响应中断，未收到完成标记');
+        finalizeStreamFailure(error, capture);
+        if (official) throw error;
         return;
       }
       if (streamFinalized) return;
@@ -832,17 +856,24 @@ async function prepareProxyResponse({ app, config, runtimeMeta, requestId, reque
       streamTimeout?.clear?.();
       resolveCompletion(capture);
     }, {
+      official,
       onChunk: () => streamTimeout?.touch?.(),
       onActivity: (event) => emitProxyActivity(onActivity, activityContext, {
         ...event,
         meta: { ...(event.meta || {}), request_id: requestId, attempt, stream: true },
       }),
       onDone: () => streamTimeout?.clear?.(),
-      onCancel: (reason, capture) => finalizeStreamFailure(
-        createStreamFailure(capture, safeErrorMessage(reason || 'AI 流式响应在完成前被取消')),
-        capture,
+      onCancel: async (reason, capture) => finalizeStreamFailure(
+        await createStreamFailure(capture, safeErrorMessage(reason || 'AI 流式响应在完成前被取消')), capture,
       ),
-      onError: (error, capture) => finalizeStreamFailure(error, capture),
+      onError: (error, capture) => {
+        if (official) {
+          markAiRequestError(error, { retryable: false });
+          error.officialStream = true;
+          error.code ||= 'AI_STREAM_INCOMPLETE';
+        }
+        finalizeStreamFailure(error, capture);
+      },
     });
 
     return {
@@ -1293,7 +1324,13 @@ function createAgentOpenAiProxy({
           },
         });
       } else {
-        try { res.end(); } catch {}
+        try {
+          // 官方流意外 EOF 不能被 Pi 当作正常完成；补发明确错误，原始错误帧已透传时不重复。
+          if (error.officialStream && ['AI_STREAM_INCOMPLETE', 'AI_STREAM_INVALID'].includes(error.code) && !res.writableEnded) {
+            res.write(`data: ${JSON.stringify({ error: { message: error.message, code: error.code } })}\n\n`);
+          }
+          res.end();
+        } catch {}
       }
     }
   });
